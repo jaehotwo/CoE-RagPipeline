@@ -6,13 +6,20 @@ import uuid
 import logging
 
 from models.schemas import (
-    AnalysisRequest, 
-    AnalysisResult, 
-    AnalysisStatus
+    AnalysisRequest,
+    AnalysisResult,
+    AnalysisStatus,
+    ItsdRecommendationRequest,
 )
 from analyzers.git_analyzer import GitAnalyzer
 from core.database import get_db
 from services.rdb_embedding_service import RDBEmbeddingService # RDBEmbeddingService 임포트
+from services.embedding_service import (
+    StructuredDatasetSpec,
+    ITSD_DATASET_SPEC,
+    get_structured_embedding_service,
+)
+from services.rag_analysis_service import AssigneeRecommendationService
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +36,24 @@ router = APIRouter(
 
 # 메모리 캐시 (성능 향상을 위해 유지, 데이터베이스와 함께 사용)
 analysis_results = {}
+
+
+DATASET_SPECS: Dict[str, StructuredDatasetSpec] = {
+    "itsd": ITSD_DATASET_SPEC,
+}
+
+
+def _resolve_dataset(dataset_name: str) -> StructuredDatasetSpec:
+    spec = DATASET_SPECS.get(dataset_name.lower())
+    if spec is None:
+        raise HTTPException(status_code=404, detail=f"Unknown dataset: {dataset_name}")
+    return spec
+
+
+def _resolve_recommendation_service(dataset_name: str) -> AssigneeRecommendationService:
+    spec = _resolve_dataset(dataset_name)
+    embedding_service = get_structured_embedding_service(spec)
+    return AssigneeRecommendationService(embedding_service=embedding_service, dataset_spec=spec)
 
 @router.post(
     "/analyze", 
@@ -316,6 +341,45 @@ async def list_analysis_results(db: Session = Depends(get_db)):
     except Exception as e:
         logger.error(f"Failed to list analysis results: {e}")
         raise HTTPException(status_code=500, detail=f"분석 결과 목록 조회 중 오류가 발생했습니다: {str(e)}")
+
+
+@router.post(
+    "/analysis/{dataset_name}/recommend-assignee",
+    summary="구조화 데이터셋 담당자 추천",
+    response_model=str,
+    tags=["Assignee Recommendation"],
+)
+async def recommend_assignee_for_dataset(
+    dataset_name: str,
+    request: ItsdRecommendationRequest,
+    page: int = 1,
+    page_size: int = 5,
+    use_rrf: bool | None = None,
+    w_title: float | None = None,
+    w_content: float | None = None,
+    rrf_k0: int | None = None,
+    top_k_each: int | None = None,
+):
+    service = _resolve_recommendation_service(dataset_name)
+    try:
+        safe_page = max(1, int(page))
+        safe_page_size = max(1, min(50, int(page_size)))
+        return await service.recommend_assignee(
+            title=request.title,
+            description=request.description,
+            page=safe_page,
+            page_size=safe_page_size,
+            use_rrf=use_rrf,
+            w_title=w_title,
+            w_content=w_content,
+            rrf_k0=rrf_k0,
+            top_k_each=top_k_each,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("담당자 추천 중 오류 발생 (dataset=%s): %s", dataset_name, exc)
+        raise HTTPException(status_code=500, detail=f"담당자 추천 중 서버 오류가 발생했습니다: {exc}")
 
 
 @router.get("/cache/stats", summary="캐시 통계 조회", description="Git 레포지토리 캐시 디렉토리의 통계 정보를 조회합니다.")

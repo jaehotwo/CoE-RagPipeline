@@ -1,7 +1,10 @@
-from fastapi import APIRouter, HTTPException, Body
-from typing import List, Optional, Dict, Any
+import asyncio
 import os
 import logging
+from datetime import datetime
+from typing import List, Optional, Dict, Any
+
+from fastapi import APIRouter, HTTPException, Body, UploadFile, File, status
 
 from models.schemas import (
     SearchRequest, 
@@ -10,6 +13,13 @@ from models.schemas import (
     EmbeddingData, 
     EmbeddingUsage
 )
+from services.embedding_service import (
+    StructuredDatasetSpec,
+    StructuredEmbeddingService,
+    ITSD_DATASET_SPEC,
+    get_structured_embedding_service,
+)
+from services.job_status_service import JobStatusStore
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +32,220 @@ router = APIRouter(
         500: {"description": "서버 오류"}
     }
 )
+
+
+DATASET_SPECS: Dict[str, StructuredDatasetSpec] = {
+    "itsd": ITSD_DATASET_SPEC,
+}
+
+
+def _resolve_dataset(dataset_name: str) -> StructuredDatasetSpec:
+    spec = DATASET_SPECS.get(dataset_name.lower())
+    if spec is None:
+        raise HTTPException(status_code=404, detail=f"Unknown dataset: {dataset_name}")
+    return spec
+
+
+def _resolve_embedding_service(dataset_name: str) -> StructuredEmbeddingService:
+    spec = _resolve_dataset(dataset_name)
+    return get_structured_embedding_service(spec)
+
+
+@router.post(
+    "/datasets/{dataset_name}/embed-excel",
+    summary="Upload structured dataset Excel for embedding",
+    tags=["🔍 Vector Search"],
+)
+async def embed_dataset_from_excel(
+    dataset_name: str,
+    file: UploadFile = File(..., description="Structured dataset Excel (.xlsx)"),
+):
+    if not file.filename.lower().endswith(".xlsx"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Excel(.xlsx) 파일만 업로드할 수 있습니다.",
+        )
+
+    service = _resolve_embedding_service(dataset_name)
+    content = await file.read()
+    try:
+        count = await asyncio.to_thread(service.embed_from_excel_bytes, content)
+        return {
+            "message": f"{dataset_name} 데이터셋 임베딩이 성공적으로 완료되었습니다.",
+            "embedded_count": count,
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except Exception as exc:
+        failed_dir = os.path.join("output", "failed_uploads", dataset_name.lower())
+        os.makedirs(failed_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        failed_path = os.path.join(failed_dir, f"{timestamp}_{file.filename}")
+        try:
+            with open(failed_path, "wb") as handle:
+                handle.write(content)
+        except Exception as write_exc:
+            logger.error("Failed to persist failed upload: %s", write_exc)
+        logger.error(
+            "Dataset embedding failed (dataset=%s, file=%s): %s",
+            dataset_name,
+            file.filename,
+            exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"파일 임베딩 중 오류가 발생했습니다. (오류 파일: {failed_path}) 원인: {exc}",
+        )
+
+
+@router.post(
+    "/datasets/{dataset_name}/embed-excel-async",
+    summary="Queue structured dataset embedding (async)",
+    tags=["🔍 Vector Search"],
+)
+async def embed_dataset_async(
+    dataset_name: str,
+    file: UploadFile = File(..., description="Structured dataset Excel (.xlsx)"),
+):
+    if not file.filename.lower().endswith(".xlsx"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Excel(.xlsx) 파일만 업로드할 수 있습니다.",
+        )
+
+    service = _resolve_embedding_service(dataset_name)
+    job_store = JobStatusStore()
+    job = job_store.create_job(task=f"{dataset_name}_embed", filename=file.filename)
+
+    uploads_dir = os.path.join("output", "uploads", dataset_name.lower())
+    os.makedirs(uploads_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    saved_path = os.path.join(uploads_dir, f"{job['job_id']}_{timestamp}_{file.filename}")
+
+    content = await file.read()
+    try:
+        with open(saved_path, "wb") as handle:
+            handle.write(content)
+    except Exception as exc:
+        job_store.fail_job(job["job_id"], error=f"파일 저장 실패: {exc}")
+        raise HTTPException(status_code=500, detail=f"업로드 파일 저장 실패: {exc}")
+
+    async def _process(job_id: str, path: str) -> None:
+        try:
+            job_store.start_job(job_id)
+
+            def _progress(progress: float | int, stage: Optional[str] = None) -> None:
+                try:
+                    JobStatusStore().set_progress(job_id, progress, stage)
+                except Exception:
+                    pass
+
+            with open(path, "rb") as handle:
+                payload = handle.read()
+            _progress(5, "file_loaded")
+            count = await asyncio.to_thread(
+                service.embed_from_excel_bytes,
+                payload,
+                _progress,
+            )
+            job_store.complete_job(job_id, result={"embedded_count": int(count) if count is not None else 0})
+        except Exception as exc:
+            logger.error("Async dataset embedding failed (dataset=%s, job=%s): %s", dataset_name, job_id, exc)
+            job_store.fail_job(job_id, error=str(exc))
+        finally:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+    asyncio.create_task(_process(job["job_id"], saved_path))
+    return {"job_id": job["job_id"], "status": "queued"}
+
+
+@router.get(
+    "/datasets/{dataset_name}/embed-jobs/{job_id}",
+    summary="Retrieve dataset embedding job status",
+    tags=["🔍 Vector Search"],
+)
+async def get_embed_job_status(dataset_name: str, job_id: str):
+    job_store = JobStatusStore()
+    data = job_store.get_job(job_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="해당 job_id를 찾을 수 없습니다.")
+    return data
+
+
+@router.post(
+    "/datasets/{dataset_name}/embed-local",
+    summary="Embed dataset from local default Excel",
+    tags=["🔍 Vector Search"],
+)
+async def embed_dataset_from_local_file(dataset_name: str):
+    spec = _resolve_dataset(dataset_name)
+    if not spec.default_local_path:
+        raise HTTPException(status_code=400, detail="로컬 임베딩이 지원되지 않습니다.")
+
+    path = spec.default_local_path
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail=f"'{path}' 파일을 찾을 수 없습니다.")
+
+    service = _resolve_embedding_service(dataset_name)
+    try:
+        with open(path, "rb") as handle:
+            content = handle.read()
+        count = await asyncio.to_thread(service.embed_from_excel_bytes, content)
+        return {
+            "message": f"'{path}' 파일의 임베딩이 성공적으로 완료되었습니다.",
+            "embedded_count": count,
+        }
+    except Exception as exc:
+        logger.error("Local dataset embedding failed (dataset=%s, path=%s): %s", dataset_name, path, exc)
+        raise HTTPException(status_code=500, detail=f"로컬 파일 임베딩 중 오류가 발생했습니다: {exc}")
+
+
+@router.get(
+    "/datasets/{dataset_name}/index-stats",
+    summary="Retrieve dataset index statistics",
+    tags=["🔍 Vector Search"],
+)
+async def dataset_index_stats(dataset_name: str):
+    service = _resolve_embedding_service(dataset_name)
+    try:
+        return service.get_index_stats()
+    except Exception as exc:
+        logger.error("Failed to get dataset index stats (dataset=%s): %s", dataset_name, exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get(
+    "/datasets/{dataset_name}/sample",
+    summary="Sample documents for a dataset variant",
+    tags=["🔍 Vector Search"],
+)
+async def dataset_sample(
+    dataset_name: str,
+    variant: str = "title",
+    limit: int = 3,
+):
+    spec = _resolve_dataset(dataset_name)
+    variant = (variant or "").strip().lower()
+    allowed_variants = {
+        spec.title_variant_name,
+        spec.content_variant_name,
+        spec.combined_variant_name,
+    }
+    if variant not in allowed_variants:
+        raise HTTPException(
+            status_code=400,
+            detail=f"variant must be one of: {', '.join(sorted(allowed_variants))}",
+        )
+    service = _resolve_embedding_service(dataset_name)
+    safe_limit = max(1, min(50, int(limit)))
+    try:
+        return service.sample_documents(variant, limit=safe_limit)
+    except Exception as exc:
+        logger.error("Failed to sample dataset documents (dataset=%s, variant=%s): %s", dataset_name, variant, exc)
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @router.post(
